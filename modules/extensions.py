@@ -1,13 +1,13 @@
+import importlib
 import traceback
 from functools import partial
+from inspect import signature
 
 import gradio as gr
 
 import extensions
 import modules.shared as shared
 from modules.logging_colors import logger
-from inspect import signature
-
 
 state = {}
 available_extensions = []
@@ -20,25 +20,32 @@ def apply_settings(extension, name):
 
     for param in extension.params:
         _id = f"{name}-{param}"
-        if _id not in shared.settings:
-            continue
-
-        extension.params[param] = shared.settings[_id]
+        shared.default_settings[_id] = extension.params[param]
+        if _id in shared.settings:
+            extension.params[param] = shared.settings[_id]
 
 
 def load_extensions():
     global state, setup_called
+    state = {}
     for i, name in enumerate(shared.args.extensions):
         if name in available_extensions:
             if name != 'api':
-                logger.info(f'Loading the extension "{name}"...')
+                logger.info(f'Loading the extension "{name}"')
             try:
-                exec(f"import extensions.{name}.script")
-                extension = getattr(extensions, name).script
-                apply_settings(extension, name)
-                if extension not in setup_called and hasattr(extension, "setup"):
+                try:
+                    extension = importlib.import_module(f"extensions.{name}.script")
+                except ModuleNotFoundError:
+                    logger.error(f"Could not import the requirements for '{name}'. Make sure to install the requirements for the extension.\n\n* To install requirements for all available extensions, launch the\n  update_wizard script for your OS and choose the B option.\n\n* To install the requirements for this extension alone, launch the\n  cmd script for your OS and paste the following command in the\n  terminal window that appears:\n\nLinux / Mac:\n\npip install -r extensions/{name}/requirements.txt --upgrade\n\nWindows:\n\npip install -r extensions\\{name}\\requirements.txt --upgrade\n")
+                    raise
+
+                # Only run setup() and apply settings from settings.yaml once
+                if extension not in setup_called:
+                    apply_settings(extension, name)
+                    if hasattr(extension, "setup"):
+                        extension.setup()
+
                     setup_called.add(extension)
-                    extension.setup()
 
                 state[name] = [True, i]
             except:
@@ -54,27 +61,41 @@ def iterator():
 
 
 # Extension functions that map string -> string
-def _apply_string_extensions(function_name, text, state):
+def _apply_string_extensions(function_name, text, state, is_chat=False):
     for extension, _ in iterator():
         if hasattr(extension, function_name):
             func = getattr(extension, function_name)
-            if len(signature(func).parameters) == 2:
-                text = func(text, state)
+
+            # Handle old extensions without the 'state' arg or
+            # the 'is_chat' kwarg
+            count = 0
+            has_chat = False
+            for k in signature(func).parameters:
+                if k == 'is_chat':
+                    has_chat = True
+                else:
+                    count += 1
+
+            if count == 2:
+                args = [text, state]
             else:
-                text = func(text)
+                args = [text]
+
+            if has_chat:
+                kwargs = {'is_chat': is_chat}
+            else:
+                kwargs = {}
+
+            text = func(*args, **kwargs)
 
     return text
 
 
-# Input hijack of extensions
-def _apply_input_hijack(text, visible_text):
+# Extension functions that map string -> string
+def _apply_chat_input_extensions(text, visible_text, state):
     for extension, _ in iterator():
-        if hasattr(extension, 'input_hijack') and extension.input_hijack['state']:
-            extension.input_hijack['state'] = False
-            if callable(extension.input_hijack['value']):
-                text, visible_text = extension.input_hijack['value'](text, visible_text)
-            else:
-                text, visible_text = extension.input_hijack['value']
+        if hasattr(extension, 'chat_input_modifier'):
+            text, visible_text = extension.chat_input_modifier(text, visible_text, state)
 
     return text, visible_text
 
@@ -120,7 +141,11 @@ def _apply_tokenizer_extensions(function_name, state, prompt, input_ids, input_e
 def _apply_logits_processor_extensions(function_name, processor_list, input_ids):
     for extension, _ in iterator():
         if hasattr(extension, function_name):
-            getattr(extension, function_name)(processor_list, input_ids)
+            result = getattr(extension, function_name)(processor_list, input_ids)
+            if type(result) is list:
+                processor_list = result
+
+    return processor_list
 
 
 # Get prompt length in tokens after applying extension functions which override the default tokenizer output
@@ -170,9 +195,7 @@ def create_extensions_block():
     if len(to_display) > 0:
         with gr.Column(elem_id="extensions"):
             for row in to_display:
-                extension, name = row
-                display_name = getattr(extension, 'params', {}).get('display_name', name)
-                gr.Markdown(f"\n### {display_name}")
+                extension, _ = row
                 extension.ui()
 
 
@@ -187,12 +210,12 @@ def create_extensions_tabs():
 EXTENSION_MAP = {
     "input": partial(_apply_string_extensions, "input_modifier"),
     "output": partial(_apply_string_extensions, "output_modifier"),
+    "chat_input": _apply_chat_input_extensions,
     "state": _apply_state_modifier_extensions,
     "history": _apply_history_modifier_extensions,
     "bot_prefix": partial(_apply_string_extensions, "bot_prefix_modifier"),
     "tokenizer": partial(_apply_tokenizer_extensions, "tokenizer_modifier"),
     'logits_processor': partial(_apply_logits_processor_extensions, 'logits_processor_modifier'),
-    "input_hijack": _apply_input_hijack,
     "custom_generate_chat_prompt": _apply_custom_generate_chat_prompt,
     "custom_generate_reply": _apply_custom_generate_reply,
     "tokenized_length": _apply_custom_tokenized_length,

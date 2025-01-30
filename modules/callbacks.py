@@ -1,4 +1,3 @@
-import gc
 import traceback
 from queue import Queue
 from threading import Thread
@@ -7,6 +6,10 @@ import torch
 import transformers
 
 import modules.shared as shared
+
+
+class StopNowException(Exception):
+    pass
 
 
 class _StopEverythingStoppingCriteria(transformers.StoppingCriteria):
@@ -24,6 +27,7 @@ class Stream(transformers.StoppingCriteria):
     def __call__(self, input_ids, scores) -> bool:
         if self.callback_func is not None:
             self.callback_func(input_ids[0])
+
         return False
 
 
@@ -47,19 +51,18 @@ class Iteratorize:
 
         def _callback(val):
             if self.stop_now or shared.stop_everything:
-                raise ValueError
+                raise StopNowException
             self.q.put(val)
 
         def gentask():
             try:
                 ret = self.mfunc(callback=_callback, *args, **self.kwargs)
-            except ValueError:
+            except StopNowException:
                 pass
             except:
                 traceback.print_exc()
                 pass
 
-            clear_torch_cache()
             self.q.put(self.sentinel)
             if self.c_callback:
                 self.c_callback(ret)
@@ -78,17 +81,10 @@ class Iteratorize:
             return obj
 
     def __del__(self):
-        clear_torch_cache()
+        pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop_now = True
-        clear_torch_cache()
-
-
-def clear_torch_cache():
-    gc.collect()
-    if not shared.args.cpu:
-        torch.cuda.empty_cache()
