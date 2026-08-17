@@ -11,7 +11,7 @@ import torch
 from PIL import Image
 
 from modules import shared
-from modules.models import reload_model, unload_model
+from modules.models import load_model, unload_model
 from modules.ui import create_refresh_button
 
 torch._C._jit_set_profiling_mode(False)
@@ -33,12 +33,13 @@ params = {
     'hr_upscaler': 'ESRGAN_4x',
     'hr_scale': '1.0',
     'seed': -1,
-    'sampler_name': 'DPM++ 2M Karras',
+    'sampler_name': 'DPM++ 2M',
     'steps': 32,
     'cfg_scale': 7,
     'textgen_prefix': 'Please provide a detailed and vivid description of [subject]',
     'sd_checkpoint': ' ',
-    'checkpoint_list': [" "]
+    'checkpoint_list': [" "],
+    'last_model': ""
 }
 
 
@@ -46,6 +47,7 @@ def give_VRAM_priority(actor):
     global shared, params
 
     if actor == 'SD':
+        params["last_model"] = shared.model_name
         unload_model()
         print("Requesting Auto1111 to re-load last checkpoint used...")
         response = requests.post(url=f'{params["address"]}/sdapi/v1/reload-checkpoint', json='')
@@ -55,7 +57,8 @@ def give_VRAM_priority(actor):
         print("Requesting Auto1111 to vacate VRAM...")
         response = requests.post(url=f'{params["address"]}/sdapi/v1/unload-checkpoint', json='')
         response.raise_for_status()
-        reload_model()
+        if params["last_model"]:
+            shared.model, shared.tokenizer = load_model(params["last_model"])
 
     elif actor == 'set':
         print("VRAM mangement activated -- requesting Auto1111 to vacate VRAM...")
@@ -132,6 +135,9 @@ def get_SD_pictures(description, character):
 
     if params['manage_VRAM']:
         give_VRAM_priority('SD')
+
+    description = re.sub('<audio.*?</audio>', ' ', description)
+    description = f"({description}:1)"
 
     payload = {
         "prompt": params['prompt_prefix'] + description,
@@ -258,7 +264,7 @@ def SD_api_address_update(address):
         response = requests.get(url=f'{params["address"]}/sdapi/v1/sd-models')
         response.raise_for_status()
         # r = response.json()
-    except:
+    except Exception:
         msg = "❌ No SD API endpoint on:"
 
     return gr.Textbox.update(label=msg)
@@ -278,7 +284,7 @@ def get_checkpoints():
         options_json = options.json()
         params['sd_checkpoint'] = options_json['sd_model_checkpoint']
         params['checkpoint_list'] = [result["title"] for result in models.json()]
-    except:
+    except Exception:
         params['sd_checkpoint'] = ""
         params['checkpoint_list'] = []
 
@@ -292,7 +298,7 @@ def load_checkpoint(checkpoint):
 
     try:
         requests.post(url=f'{params["address"]}/sdapi/v1/options', json=payload)
-    except:
+    except Exception:
         pass
 
 
@@ -301,7 +307,7 @@ def get_samplers():
         response = requests.get(url=f'{params["address"]}/sdapi/v1/samplers')
         response.raise_for_status()
         samplers = [x["name"] for x in response.json()]
-    except:
+    except Exception:
         samplers = []
 
     return samplers
@@ -332,11 +338,11 @@ def ui():
             negative_prompt = gr.Textbox(placeholder=params['negative_prompt'], value=params['negative_prompt'], label='Negative Prompt')
             with gr.Row():
                 with gr.Column():
-                    width = gr.Slider(256, 768, value=params['width'], step=64, label='Width')
-                    height = gr.Slider(256, 768, value=params['height'], step=64, label='Height')
+                    width = gr.Slider(64, 2048, value=params['width'], step=64, label='Width')
+                    height = gr.Slider(64, 2048, value=params['height'], step=64, label='Height')
                 with gr.Column(variant="compact", elem_id="sampler_col"):
                     with gr.Row(elem_id="sampler_row"):
-                        sampler_name = gr.Dropdown(value=params['sampler_name'], label='Sampling method', elem_id="sampler_box")
+                        sampler_name = gr.Dropdown(value=params['sampler_name'], allow_custom_value=True, label='Sampling method', elem_id="sampler_box")
                         create_refresh_button(sampler_name, lambda: None, lambda: {'choices': get_samplers()}, 'refresh-button')
                     steps = gr.Slider(1, 150, value=params['steps'], step=1, label="Sampling steps", elem_id="steps_box")
             with gr.Row():

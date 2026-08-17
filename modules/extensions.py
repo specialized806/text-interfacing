@@ -1,13 +1,12 @@
-import traceback
+import importlib
+import importlib.util
+import sys
 from functools import partial
+from inspect import signature
+from pathlib import Path
 
-import gradio as gr
-
-import extensions
 import modules.shared as shared
 from modules.logging_colors import logger
-from inspect import signature
-
 
 state = {}
 available_extensions = []
@@ -20,61 +19,106 @@ def apply_settings(extension, name):
 
     for param in extension.params:
         _id = f"{name}-{param}"
-        if _id not in shared.settings:
-            continue
-
-        extension.params[param] = shared.settings[_id]
+        shared.default_settings[_id] = extension.params[param]
+        if _id in shared.settings:
+            extension.params[param] = shared.settings[_id]
 
 
 def load_extensions():
     global state, setup_called
-    for i, name in enumerate(shared.args.extensions):
-        if name in available_extensions:
-            if name != 'api':
-                logger.info(f'Loading the extension "{name}"...')
-            try:
-                exec(f"import extensions.{name}.script")
-                extension = getattr(extensions, name).script
-                apply_settings(extension, name)
-                if extension not in setup_called and hasattr(extension, "setup"):
-                    setup_called.add(extension)
-                    extension.setup()
+    state = {}
 
-                state[name] = [True, i]
-            except:
-                logger.error(f'Failed to load the extension "{name}".')
-                traceback.print_exc()
+    for i, name in enumerate(shared.args.extensions):
+        if name not in available_extensions:
+            continue
+
+        logger.info(f'Loading the extension "{name}"')
+
+        try:
+            # Prefer user extension, fall back to system extension
+            user_script_path = shared.user_data_dir / 'extensions' / name / 'script.py'
+            if user_script_path.exists():
+                spec = importlib.util.spec_from_file_location(
+                    f"user_ext_{name}",
+                    str(user_script_path)
+                )
+                extension = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = extension
+                spec.loader.exec_module(extension)
+            else:
+                extension = importlib.import_module(f"extensions.{name}.script")
+
+            if extension not in setup_called:
+                apply_settings(extension, name)
+                if hasattr(extension, "setup"):
+                    extension.setup()
+                setup_called.add(extension)
+
+            state[name] = [True, i, extension]  # Store extension object
+
+        except ModuleNotFoundError:
+            extension_location = shared.user_data_dir / 'extensions' / name if user_script_path.exists() else Path('extensions') / name
+            windows_path = str(extension_location).replace('/', '\\')
+            logger.error(
+                f"Could not import the requirements for '{name}'. Make sure to install the requirements for the extension.\n\n"
+                f"* To install requirements automatically, launch the update_wizard script for your OS and:\n\n"
+                f"1. Choose option B (Install/update extensions requirements)\n"
+                f"2. Select '{name}' from the extension list\n\n"
+                f"* To install requirements manually, launch the cmd script for your OS and paste the following command:\n\n"
+                f"Linux / Mac:\n\n"
+                f"pip install -r {extension_location}/requirements.txt --upgrade\n\n"
+                f"Windows:\n\n"
+                f"pip install -r {windows_path}\\requirements.txt --upgrade\n"
+            )
+            raise
+
+        except Exception:
+            logger.exception(f'Failed to load the extension "{name}".')
 
 
 # This iterator returns the extensions in the order specified in the command-line
 def iterator():
     for name in sorted(state, key=lambda x: state[x][1]):
         if state[name][0]:
-            yield getattr(extensions, name).script, name
+            yield state[name][2], name  # Use stored extension object
 
 
 # Extension functions that map string -> string
-def _apply_string_extensions(function_name, text, state):
+def _apply_string_extensions(function_name, text, state, is_chat=False):
     for extension, _ in iterator():
         if hasattr(extension, function_name):
             func = getattr(extension, function_name)
-            if len(signature(func).parameters) == 2:
-                text = func(text, state)
+
+            # Handle old extensions without the 'state' arg or
+            # the 'is_chat' kwarg
+            count = 0
+            has_chat = False
+            for k in signature(func).parameters:
+                if k == 'is_chat':
+                    has_chat = True
+                else:
+                    count += 1
+
+            if count == 2:
+                args = [text, state]
             else:
-                text = func(text)
+                args = [text]
+
+            if has_chat:
+                kwargs = {'is_chat': is_chat}
+            else:
+                kwargs = {}
+
+            text = func(*args, **kwargs)
 
     return text
 
 
-# Input hijack of extensions
-def _apply_input_hijack(text, visible_text):
+# Extension functions that map string -> string
+def _apply_chat_input_extensions(text, visible_text, state):
     for extension, _ in iterator():
-        if hasattr(extension, 'input_hijack') and extension.input_hijack['state']:
-            extension.input_hijack['state'] = False
-            if callable(extension.input_hijack['value']):
-                text, visible_text = extension.input_hijack['value'](text, visible_text)
-            else:
-                text, visible_text = extension.input_hijack['value']
+        if hasattr(extension, 'chat_input_modifier'):
+            text, visible_text = extension.chat_input_modifier(text, visible_text, state)
 
     return text, visible_text
 
@@ -120,7 +164,11 @@ def _apply_tokenizer_extensions(function_name, state, prompt, input_ids, input_e
 def _apply_logits_processor_extensions(function_name, processor_list, input_ids):
     for extension, _ in iterator():
         if hasattr(extension, function_name):
-            getattr(extension, function_name)(processor_list, input_ids)
+            result = getattr(extension, function_name)(processor_list, input_ids)
+            if type(result) is list:
+                processor_list = result
+
+    return processor_list
 
 
 # Get prompt length in tokens after applying extension functions which override the default tokenizer output
@@ -143,24 +191,23 @@ def _apply_custom_generate_reply():
 
 
 def _apply_custom_css():
-    all_css = ''
-    for extension, _ in iterator():
-        if hasattr(extension, 'custom_css'):
-            all_css += getattr(extension, 'custom_css')()
-
-    return all_css
+    return ''.join(
+        getattr(extension, 'custom_css')()
+        for extension, _ in iterator()
+        if hasattr(extension, 'custom_css')
+    )
 
 
 def _apply_custom_js():
-    all_js = ''
-    for extension, _ in iterator():
-        if hasattr(extension, 'custom_js'):
-            all_js += getattr(extension, 'custom_js')()
-
-    return all_js
+    return ''.join(
+        getattr(extension, 'custom_js')()
+        for extension, _ in iterator()
+        if hasattr(extension, 'custom_js')
+    )
 
 
 def create_extensions_block():
+    import gradio as gr
     to_display = []
     for extension, name in iterator():
         if hasattr(extension, "ui") and not (hasattr(extension, 'params') and extension.params.get('is_tab', False)):
@@ -170,13 +217,12 @@ def create_extensions_block():
     if len(to_display) > 0:
         with gr.Column(elem_id="extensions"):
             for row in to_display:
-                extension, name = row
-                display_name = getattr(extension, 'params', {}).get('display_name', name)
-                gr.Markdown(f"\n### {display_name}")
+                extension, _ = row
                 extension.ui()
 
 
 def create_extensions_tabs():
+    import gradio as gr
     for extension, name in iterator():
         if hasattr(extension, "ui") and (hasattr(extension, 'params') and extension.params.get('is_tab', False)):
             display_name = getattr(extension, 'params', {}).get('display_name', name)
@@ -187,12 +233,12 @@ def create_extensions_tabs():
 EXTENSION_MAP = {
     "input": partial(_apply_string_extensions, "input_modifier"),
     "output": partial(_apply_string_extensions, "output_modifier"),
+    "chat_input": _apply_chat_input_extensions,
     "state": _apply_state_modifier_extensions,
     "history": _apply_history_modifier_extensions,
     "bot_prefix": partial(_apply_string_extensions, "bot_prefix_modifier"),
     "tokenizer": partial(_apply_tokenizer_extensions, "tokenizer_modifier"),
     'logits_processor': partial(_apply_logits_processor_extensions, 'logits_processor_modifier'),
-    "input_hijack": _apply_input_hijack,
     "custom_generate_chat_prompt": _apply_custom_generate_chat_prompt,
     "custom_generate_reply": _apply_custom_generate_reply,
     "tokenized_length": _apply_custom_tokenized_length,

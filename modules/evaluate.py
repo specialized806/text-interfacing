@@ -2,22 +2,18 @@ import datetime
 from pathlib import Path
 
 import pandas as pd
-import torch
-from datasets import load_dataset
 from tqdm import tqdm
 
 from modules import shared
+from modules.logging_colors import logger
 from modules.models import load_model, unload_model
-from modules.models_settings import (
-    get_model_settings_from_yamls,
-    update_model_parameters
-)
+from modules.models_settings import get_model_metadata, update_model_parameters
 from modules.text_generation import encode
 
 
 def load_past_evaluations():
-    if Path('logs/evaluations.csv').exists():
-        df = pd.read_csv(Path('logs/evaluations.csv'), dtype=str)
+    if (shared.user_data_dir / 'logs' / 'evaluations.csv').exists():
+        df = pd.read_csv(shared.user_data_dir / 'logs' / 'evaluations.csv', dtype=str)
         df['Perplexity'] = pd.to_numeric(df['Perplexity'])
         return df
     else:
@@ -30,7 +26,7 @@ past_evaluations = load_past_evaluations()
 def save_past_evaluations(df):
     global past_evaluations
     past_evaluations = df
-    filepath = Path('logs/evaluations.csv')
+    filepath = shared.user_data_dir / 'logs' / 'evaluations.csv'
     filepath.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(filepath, index=False)
 
@@ -40,6 +36,18 @@ def calculate_perplexity(models, input_dataset, stride, _max_length):
     Based on:
     https://huggingface.co/docs/transformers/perplexity#calculating-ppl-with-fixedlength-models
     '''
+
+    import torch
+    from datasets import load_dataset
+
+    from modules.torch_utils import clear_torch_cache
+
+    if shared.args.loader == "llama.cpp":
+        logger.error("Perplexity evaluation is not implemented for the llama.cpp loader.")
+        raise ValueError
+
+    if not shared.args.no_use_fast:
+        logger.warning("--no_use_fast is not set. If tokenizing the input dataset takes a long time, try reloading the model with that option set/checked.")
 
     global past_evaluations
     cumulative_log = ''
@@ -57,30 +65,29 @@ def calculate_perplexity(models, input_dataset, stride, _max_length):
         data = load_dataset('ptb_text_only', 'penn_treebank', split='test')
         text = " ".join(data['sentence'])
     else:
-        with open(Path(f'training/datasets/{input_dataset}.txt'), 'r', encoding='utf-8') as f:
+        with open(shared.user_data_dir / 'training' / 'datasets' / f'{input_dataset}.txt', 'r', encoding='utf-8') as f:
             text = f.read()
 
     for model in models:
         if is_in_past_evaluations(model, input_dataset, stride, _max_length):
-            cumulative_log += f"{model} has already been tested. Ignoring.\n\n"
+            cumulative_log += f"`{model}` has already been tested. Ignoring.\n\n"
             yield cumulative_log
             continue
 
         if model != 'current model':
             try:
-                yield cumulative_log + f"Loading {model}...\n\n"
-                model_settings = get_model_settings_from_yamls(model)
-                shared.settings.update(model_settings)  # hijacking the interface defaults
+                yield cumulative_log + f"Loading `{model}`...\n\n"
+                model_settings = get_model_metadata(model)
+                shared.settings.update({k: v for k, v in model_settings.items() if k in shared.settings})  # hijacking the interface defaults
                 update_model_parameters(model_settings)  # hijacking the command-line arguments
-                shared.model_name = model
                 unload_model()
-                shared.model, shared.tokenizer = load_model(shared.model_name)
-            except:
-                cumulative_log += f"Failed to load {model}. Moving on.\n\n"
+                shared.model, shared.tokenizer = load_model(model)
+            except Exception:
+                cumulative_log += f"Failed to load `{model}`. Moving on.\n\n"
                 yield cumulative_log
                 continue
 
-        cumulative_log += f"Processing {shared.model_name}...\n\n"
+        cumulative_log += f"Processing `{shared.model_name}`...\n\n"
         yield cumulative_log + "Tokenizing the input dataset...\n\n"
         encodings = encode(text, add_special_tokens=False)
         seq_len = encodings.shape[1]
@@ -100,7 +107,7 @@ def calculate_perplexity(models, input_dataset, stride, _max_length):
             input_ids = encodings[:, begin_loc:end_loc]
             target_ids = input_ids.clone()
             target_ids[:, :-trg_len] = -100
-
+            clear_torch_cache()
             with torch.no_grad():
                 outputs = shared.model(input_ids=input_ids, labels=target_ids)
 
@@ -110,15 +117,19 @@ def calculate_perplexity(models, input_dataset, stride, _max_length):
                 neg_log_likelihood = outputs.loss
 
             nlls.append(neg_log_likelihood)
-
             prev_end_loc = end_loc
             if end_loc == seq_len:
                 break
 
         ppl = torch.exp(torch.stack(nlls).mean())
+
         add_entry_to_past_evaluations(float(ppl), shared.model_name, input_dataset, stride, _max_length)
         save_past_evaluations(past_evaluations)
-        cumulative_log += f"The perplexity for {shared.model_name} is: {float(ppl)}\n\n"
+
+        message = f"The perplexity for `{shared.model_name}` is: {float(ppl)}"
+        logger.info(message)
+
+        cumulative_log += f"{message}\n\n"
         yield cumulative_log
 
 
